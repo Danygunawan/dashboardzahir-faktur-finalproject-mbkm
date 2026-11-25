@@ -1,0 +1,5 @@
+# Pengujian web/demo sintetis; sengaja tanpa Paddle/OCR atau model.
+Pillow==12.3.0
+PyMuPDF==1.28.2
+openpyxl==3.1.5
+et-xmlfile==2.0.0

@@ -1,0 +1,6 @@
+# OCR umum dan CPU; tanpa extras all, training, CUDA, atau mesin OCR lain.
+paddlepaddle==3.3.0
+paddleocr==3.3.2
+paddlex==3.3.13
+# Paket yang dipakai langsung skrip untuk gambar/pratinjau; sudah terpasang lewat dependensi OCR.
+Pillow==12.3.0

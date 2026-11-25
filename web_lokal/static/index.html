@@ -1,0 +1,49 @@
+﻿<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ekstraksi Faktur | Zahir ONE</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/theme.js"></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <svg class="theme-filters" width="0" height="0" aria-hidden="true"><defs><filter id="zahir-logo-dark" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="0 0 0 0 1 -1.2 1.2 0 0 1 -1.2 1.2 0 0 1 0 0 0 1 0"/></filter></defs></svg>
+  <header class="header"><a id="brand-home" href="/" aria-label="Zahir ONE — beranda"><img src="/zahir-one.png" alt="Zahir ONE" width="2172" height="724"></a><nav aria-label="Menu utama"><button id="nav-home" type="button" class="nav-link active" aria-current="page">Home</button><button id="nav-data" type="button" class="nav-link">Data</button></nav><button id="theme-toggle" type="button" class="theme-toggle" aria-label="Ganti tema" aria-pressed="false"><span aria-hidden="true">☾</span></button></header>
+  <main>
+    <p id="app-error" class="error" role="alert" hidden></p>
+    <section id="screen-select" class="screen select-screen" aria-labelledby="select-title">
+      <h1 id="select-title">Ekstraksi Faktur</h1>
+      <p class="subtitle">Ubah dokumen faktur menjadi data Excel atau CSV.</p>
+      <fieldset class="kind-picker"><legend class="sr-only">Jenis dokumen</legend><label><input type="radio" name="jenis" value="gambar" checked><span>Gambar</span></label><label><input type="radio" name="jenis" value="pdf"><span>PDF</span></label></fieldset>
+      <button id="select-document" class="primary select-button" type="button">Select document</button>
+      <p id="selection-hint" class="hint">Maksimal 60 gambar · 25 MB per file</p>
+      <p id="selection-status" class="selection-status" role="status" aria-live="polite"></p>
+      <button id="resume-home" class="text-button" type="button" hidden>Lanjutkan pilihan</button>
+    </section>
+    <section id="screen-configure" class="screen" aria-labelledby="configure-title" hidden>
+      <div class="conversion-layout">
+        <div class="file-area"><div class="file-heading"><div><h1 id="configure-title">Dokumen pilihan</h1><p id="file-count" class="subtitle"></p></div><button id="add-files" type="button" class="secondary">+ Tambah file</button></div><ul id="file-list" class="file-list" aria-label="File yang dipilih"></ul><button id="choose-again" class="text-button" type="button">Pilih ulang</button></div>
+        <aside class="conversion-panel" aria-labelledby="conversion-title"><h2 id="conversion-title">Konversi Gambar</h2><label for="result-format">Format hasil</label><select id="result-format"><option value="xlsx">Excel (.xlsx)</option><option value="csv">CSV</option></select><button id="start-conversion" class="primary" type="button">Mulai konversi <span aria-hidden="true">→</span></button>
+          <div id="progress-panel" hidden><p id="progress-count" role="status" aria-live="polite"></p><progress id="progress-bar" max="1" value="0" aria-label="Dokumen selesai"></progress><p id="progress-message" class="hint"></p><ul id="processing-files" class="processing-files"></ul><button id="retry-status" type="button" class="text-button" hidden>Coba sambungkan kembali</button><button id="failed-restart" type="button" class="secondary" hidden>Mulai lagi</button></div>
+        </aside>
+      </div>
+      <div class="back-row"><button id="back-configure" class="text-button" type="button">← Kembali</button></div>
+    </section>
+    <section id="screen-results" class="screen result-screen" aria-labelledby="results-title" hidden>
+      <div class="result-intro"><span class="success-mark" aria-hidden="true">✓</span><h1 id="results-title">Hasil siap diunduh</h1><p id="result-count" class="subtitle"></p><div class="result-actions"><a id="download-result" class="primary" href="#">Unduh Excel</a><button id="start-again" class="secondary" type="button">Mulai lagi</button></div><p id="download-note" class="hint"></p></div>
+      <div id="partial-results" class="partial-results" hidden><p id="partial-summary"></p><ul id="failed-files"></ul></div>
+      <div class="results-data"><div class="table-toolbar"><div class="tabs" role="tablist" aria-label="Tabel hasil"><button id="tab-faktur" class="tab active" type="button" role="tab" aria-controls="data-table" aria-selected="true" data-table="faktur">Faktur</button><button id="tab-detail_faktur" class="tab" type="button" role="tab" aria-controls="data-table" aria-selected="false" tabindex="-1" data-table="detail_faktur">Detail Faktur</button></div><button id="review-link" type="button" class="text-button" aria-expanded="false" aria-controls="review-panel" hidden>Catatan review</button></div><div id="data-table" class="table-scroll" role="tabpanel" aria-labelledby="tab-faktur" tabindex="0"></div><section id="review-panel" class="review-panel" aria-label="Catatan review" hidden></section></div>
+      <div class="back-row"><button id="back-results" class="text-button" type="button">← Kembali</button></div>
+    </section>
+    <section id="screen-data" class="screen" aria-labelledby="data-title" hidden>
+      <div class="data-heading"><div><h1 id="data-title">Data</h1><p class="subtitle">Gabungan hasil sesi web yang tersimpan.</p><p id="data-count" class="hint" role="status" aria-live="polite"></p></div><div class="data-actions"><a id="data-excel" href="/api/data/download/data_faktur.xlsx" class="primary" download="data_faktur.xlsx">Unduh Excel</a><a id="data-csv" href="/api/data/download/data_faktur_csv.zip" class="secondary" download="data_faktur_csv.zip">Unduh CSV (.zip)</a><button id="data-refresh" type="button" class="text-button">Perbarui</button></div></div>
+      <p id="data-problems" class="error" role="status" hidden></p>
+      <div class="table-toolbar"><div class="tabs" role="tablist" aria-label="Tabel gabungan"><button id="data-tab-faktur" class="tab active" type="button" role="tab" aria-controls="data-grid" aria-selected="true" data-table="faktur">Faktur</button><button id="data-tab-detail_faktur" class="tab" type="button" role="tab" aria-controls="data-grid" aria-selected="false" tabindex="-1" data-table="detail_faktur">Detail Faktur</button></div></div>
+      <div id="data-grid" class="table-scroll" role="tabpanel" aria-labelledby="data-tab-faktur" tabindex="0"></div>
+    </section>
+    <input id="document-input" type="file" multiple accept=".jpg,.jpeg,.png,.bmp,.webp,.tif,.tiff" hidden>
+  </main>
+</body>
+</html>

@@ -1,0 +1,4 @@
+# Server HTTP memakai standard library Python; openpyxl untuk unduhan XLSX.
+-r requirements-ocr.txt
+-r requirements-pdf.txt
+openpyxl==3.1.5

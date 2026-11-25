@@ -1,0 +1,59 @@
+name: Demo preparation CI
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-tests:
+    name: Python 3.12 - ${{ matrix.os }} - no OCR
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install test dependencies only
+        run: python -m pip install -r requirements-ci.txt
+      - name: Audit tracked source
+        run: python scripts/audit_source.py --check
+      - name: Synthetic web tests - real OCR blocked
+        run: python scripts/test_ci.py
+      - name: JavaScript syntax
+        run: |
+          node --check web_lokal/static/app.js
+          node --check web_lokal/static/theme.js
+          node --check uji_tampilan_web_lokal.mjs
+
+  browser-demo:
+    name: Browser demo - synthetic data only
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: python -m pip install -r requirements-ci.txt
+      - name: Home, Data, theme, navigation and downloads without OCR
+        run: python uji_alur_web_lokal.py --output .local/ci-browser

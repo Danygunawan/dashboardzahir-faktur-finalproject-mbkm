@@ -1,0 +1,5 @@
+# Hash konfigurasi mesin membaca byte Python: jangan normalisasi berkas mesin.
+* text=auto eol=lf
+*.py -text
+*.png binary
+*.woff2 binary
