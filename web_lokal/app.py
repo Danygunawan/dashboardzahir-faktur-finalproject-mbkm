@@ -391,7 +391,8 @@ class Handler(BaseHTTPRequestHandler):
             origin = self.headers.get('Origin')
             host = self.headers.get('Host', '')
             if origin and origin not in (f'http://{host}', f'https://{host}'):
-                return self.reply(403, {'error': 'Asal permintaan tidak diizinkan.'})
+                if not (os.environ.get('PORT') and (origin.endswith('.hf.space') or origin == 'https://huggingface.co' or origin.endswith('.koyeb.app') or origin.endswith('.onrender.com'))):
+                    return self.reply(403, {'error': 'Asal permintaan tidak diizinkan.'})
             if self.path not in {'/api/jobs', '/api/uploads'}:
                 return self.reply(404, {'error': 'Endpoint tidak ditemukan.'})
             if self.path == '/api/uploads':

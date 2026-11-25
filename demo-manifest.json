@@ -53,6 +53,7 @@
     "cakupan_dokumen.py",
     "demo-manifest.json",
     "diskon_item_bersatuan.py",
+    "Dockerfile",
     "docs/CI.md",
     "docs/INSTALL.md",
     "docs/REVIEW-BEFORE-PUSH.md",

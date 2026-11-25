@@ -47,6 +47,7 @@
 !/normalisasi_angka.py
 !/pemulihan_angka.py
 !/pilah_dokumen.py
+!/Dockerfile
 !/Procfile
 !/profil_format_uang.py
 !/profil_uang_tabel.py
