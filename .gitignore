@@ -45,7 +45,6 @@
 !/label_region_invoice.py
 !/nilai_review_faktur.py
 !/normalisasi_angka.py
-!/packages.txt
 !/pemulihan_angka.py
 !/pilah_dokumen.py
 !/Dockerfile

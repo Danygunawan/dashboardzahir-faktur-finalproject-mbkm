@@ -1,19 +1,25 @@
 """Entrypoint Streamlit Community Cloud yang menjalankan mesin ekstraksi asli dengan UI web_lokal/static."""
 import base64
 import gc
+import importlib.metadata
+import importlib.util
 import json
 import os
 import re
+import shutil
+import time
 import traceback
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 import batch_faktur
-from batch_common import now
-from batch_faktur import OCRCache, run_batch
+from batch_common import complete, digest, now, seal
+from batch_faktur import OCRCache, ocr_config, run_batch
+from uji_ocr_gambar import CONFIG, buat_segmen, pratinjau
 from web_lokal.app import (
     DOWNLOADS,
     IMAGE_FORMATS,
@@ -30,14 +36,141 @@ from web_lokal.data import collect_data, data_csv_zip, data_excel_bytes
 from web_lokal.downloads import excel_bytes, session_csv_zip, session_excel_bytes
 from web_lokal.io import atomic_json, read_json
 
+_FALLBACK_VERSIONS = {
+    'paddleocr': '3.3.2',
+    'paddlepaddle': '3.3.0',
+    'paddlex': '3.3.13',
+}
+_orig_version = importlib.metadata.version
+
+
+def _safe_pkg_version(name):
+    try:
+        return _orig_version(name)
+    except importlib.metadata.PackageNotFoundError:
+        if name in _FALLBACK_VERSIONS:
+            return _FALLBACK_VERSIONS[name]
+        raise
+
+
+importlib.metadata.version = _safe_pkg_version
+
 
 class CloudJobStore(JobStore):
-    """JobStore yang menjalankan pipeline batch_faktur asli dengan model OCR ter-cache di memori."""
+    """JobStore yang menjalankan pipeline batch_faktur asli dengan dukungan PaddleOCR maupun RapidOCR ONNX."""
 
     def __init__(self, root=OUTPUT):
         super().__init__(root=root, recover=True)
         self._shared_ocr_model = None
+        self._shared_rapid_model = None
         self._shared_load_seconds = 0.0
+
+    def _obtain_with_rapidocr(self, cache_self, path, h, page, meta, dpi=None):
+        started = time.perf_counter()
+        key = cache_self.key(h, page, dpi)
+        for folder in sorted(cache_self.root.glob(key + '_*')):
+            if complete(folder):
+                d = read_json(folder / 'teks_koordinat_ocr.json')
+                if cache_self.valid_data(d):
+                    cache_self.stats.append({
+                        'halaman': page,
+                        'metode': 'cache_ocr',
+                        'detik': time.perf_counter() - started,
+                        'cache': str(folder),
+                    })
+                    return d, folder
+
+        folder = cache_self.root / (key + '_' + uuid4().hex[:8])
+        folder.mkdir()
+        previous = cache_self.previous(h) if dpi is None and page == 1 else None
+        if previous:
+            src, d = previous
+            for name in ['ocr_mentah.json', 'teks_koordinat_ocr.json', 'pratinjau_ocr.png']:
+                shutil.copyfile(src.parent / name, folder / name)
+            atomic_json(folder / 'asal_cache.json', {'input': str(src), 'sha256': digest(src), 'key': key, 'config': ocr_config()})
+            method = 'impor_cache_ocr_valid'
+        else:
+            if self._shared_rapid_model is None:
+                t = time.perf_counter()
+                try:
+                    from rapidocr import RapidOCR
+                except ImportError:
+                    from rapidocr_onnxruntime import RapidOCR
+                self._shared_rapid_model = RapidOCR()
+                self._shared_load_seconds += time.perf_counter() - t
+            cache_self.load_seconds = self._shared_load_seconds
+
+            from PIL import Image
+            with Image.open(path) as im:
+                if im.getexif().get(274, 1) != 1:
+                    raise ValueError('Rotasi EXIF belum didukung')
+                image = im.convert('RGB')
+                w, hh = image.size
+
+            t = time.perf_counter()
+            out = self._shared_rapid_model(str(path))
+            infer = time.perf_counter() - t
+
+            texts, scores, polys = [], [], []
+            if hasattr(out, 'boxes') and out.boxes is not None:
+                raw_boxes = out.boxes.tolist() if hasattr(out.boxes, 'tolist') else list(out.boxes)
+                raw_txts = list(out.txts) if out.txts is not None else []
+                raw_scores = list(out.scores) if out.scores is not None else []
+                for box, txt, sc in zip(raw_boxes, raw_txts, raw_scores):
+                    polys.append([[float(pt[0]), float(pt[1])] for pt in box])
+                    texts.append(str(txt))
+                    scores.append(float(sc))
+            elif isinstance(out, tuple) and out[0]:
+                for item in out[0]:
+                    box, txt, sc = item[0], item[1], item[2]
+                    polys.append([[float(pt[0]), float(pt[1])] for pt in box])
+                    texts.append(str(txt))
+                    scores.append(float(sc))
+
+            raw = {
+                'rec_texts': texts,
+                'rec_scores': scores,
+                'rec_polys': polys,
+                'dt_polys': polys,
+            }
+            atomic_json(folder / 'ocr_mentah.json', raw)
+            segments = buat_segmen(raw, path, w, hh, 0.85)
+            d = {
+                'versi_skema': 1,
+                'sumber_gambar': str(path),
+                'sha256_sumber_sebelum': h,
+                'sha256_sumber_sesudah': h,
+                'inventaris': meta,
+                'nomor_halaman': 1,
+                'ukuran_gambar': {'lebar': w, 'tinggi': hh},
+                'satuan_koordinat': 'piksel',
+                'gambar_acuan_koordinat': str(path),
+                'transformasi_aplikasi': {'jenis': 'identitas'},
+                'konfigurasi': CONFIG,
+                'versi_paket_utama': ocr_config()['paket'],
+                'segmen': segments,
+                'waktu_detik': {'inferensi': infer},
+                'sumber_dokumen': meta['path_sumber'],
+                'halaman_dokumen': page,
+                'render_dpi': dpi,
+            }
+            atomic_json(folder / 'teks_koordinat_ocr.json', d)
+            pratinjau(image, segments, folder / 'pratinjau_ocr.png')
+            atomic_json(
+                folder / 'asal_cache.json',
+                {'key': key, 'config': ocr_config(), 'sha256_input_render': digest(path), 'inferensi_detik': infer},
+            )
+            method = 'ocr_baru'
+
+        seal(folder)
+        cache_self.stats.append({
+            'halaman': page,
+            'metode': method,
+            'detik': time.perf_counter() - started,
+            'cache': str(folder),
+            'waktu_ocr_asal': d.get('waktu_detik'),
+        })
+        return d, folder
 
     def _run(self, folder):
         folder = Path(folder).resolve()
@@ -51,8 +184,10 @@ class CloudJobStore(JobStore):
             os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
             os.environ.setdefault('PADDLE_PDX_MODEL_SOURCE', 'BOS')
 
+            has_paddle = importlib.util.find_spec('paddleocr') is not None
             original_writer = batch_faktur.atomic_json
             original_init = OCRCache.__init__
+            original_obtain = OCRCache.obtain
             store_ref = self
             holder = {'cache': None}
 
@@ -63,8 +198,14 @@ class CloudJobStore(JobStore):
                     cache_self.load_seconds = store_ref._shared_load_seconds
                 holder['cache'] = cache_self
 
+            def patched_obtain(cache_self, path, h, page, meta, dpi=None):
+                if has_paddle:
+                    return original_obtain(cache_self, path, h, page, meta, dpi)
+                return store_ref._obtain_with_rapidocr(cache_self, path, h, page, meta, dpi)
+
             batch_faktur.atomic_json = atomic_json
             OCRCache.__init__ = patched_init
+            OCRCache.obtain = patched_obtain
             try:
                 run_batch(
                     folder / 'manifest.json',
@@ -78,6 +219,7 @@ class CloudJobStore(JobStore):
                     store_ref._shared_ocr_model = holder['cache'].model
                     store_ref._shared_load_seconds = holder['cache'].load_seconds
                 OCRCache.__init__ = original_init
+                OCRCache.obtain = original_obtain
                 batch_faktur.atomic_json = original_writer
 
             progress = read_json(folder / 'run/progres.json')
