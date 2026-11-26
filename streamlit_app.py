@@ -7,10 +7,11 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import traceback
-from pathlib import Path
-from urllib.parse import urlsplit
+from pathlib import Path, PureWindowsPath
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import streamlit as st
@@ -23,14 +24,18 @@ from uji_ocr_gambar import CONFIG, buat_segmen, pratinjau
 from web_lokal.app import (
     DOWNLOADS,
     IMAGE_FORMATS,
+    LIMITS,
     InvalidUpload,
     JobStore,
     MAX_BODY,
+    MAX_FILE,
     OUTPUT,
     STATIC,
     TABLES,
     TERMINAL,
     parse_upload,
+    validate_content,
+    validate_selection,
 )
 from web_lokal.data import collect_data, data_csv_zip, data_excel_bytes
 from web_lokal.downloads import excel_bytes, session_csv_zip, session_excel_bytes
@@ -54,6 +59,36 @@ def _safe_pkg_version(name):
 
 
 importlib.metadata.version = _safe_pkg_version
+
+_CHUNK_LOCK = threading.Lock()
+_UPLOAD_BUFFERS = {}
+
+
+def _stage_single_file(store, kind, filename, payload):
+    """Validasi dan simpan 1 file unggahan persis seperti parse_upload + store.stage."""
+    if kind not in LIMITS or not filename:
+        raise InvalidUpload('Pilih dokumen gambar atau PDF yang valid.')
+    filename = PureWindowsPath(filename).name
+    if (
+        not filename
+        or len(filename) > 180
+        or filename in {'.', '..'}
+        or any(ord(c) < 32 or c in '<>:"/\\|?*' for c in filename)
+        or filename.endswith((' ', '.'))
+        or PureWindowsPath(filename).is_reserved()
+    ):
+        raise InvalidUpload('Nama file tidak valid; ganti nama lalu unggah kembali.')
+    if not payload or len(payload) > MAX_FILE:
+        raise InvalidUpload('Setiap file harus berisi data dan berukuran maksimal 25 MB.')
+    suffix = Path(filename).suffix.lower()
+    if (kind == 'pdf' and suffix != '.pdf') or (kind == 'gambar' and suffix not in IMAGE_FORMATS):
+        raise InvalidUpload('Jenis file tidak sesuai: gunakan gambar yang didukung atau PDF.')
+    validate_selection([kind])
+    try:
+        validate_content(payload, suffix)
+    except InvalidUpload as exc:
+        raise InvalidUpload(filename + ': ' + str(exc)) from exc
+    return store.stage([(kind, filename, payload)])
 
 
 class CloudJobStore(JobStore):
@@ -243,11 +278,51 @@ class CloudJobStore(JobStore):
                 atomic_json(state_path, state)
 
 
-def _execute_get(store, api_path):
-    """Jalankan logika GET API web_lokal dan kembalikan (status_code, body, content_type, filename)."""
+def _execute_get(store, api_path, query_string=''):
+    """Jalankan logika GET API web_lokal (termasuk upload_chunk dan create_job via GET)."""
     try:
         if api_path == '/api/health':
-            return 200, {'status': 'ok', 'tahap': 1}, 'application/json; charset=utf-8', None
+            return 200, {'status': 'ok', 'tahap': 1, 'v': 3}, 'application/json; charset=utf-8', None
+
+        if api_path == '/api/upload_chunk':
+            params = {k: v[0] for k, v in parse_qs(query_string, keep_blank_values=True).items()}
+            uid = params.get('uid', '')
+            if not re.fullmatch(r'[a-f0-9]{16,64}', uid):
+                raise InvalidUpload('ID unggahan tidak valid.')
+            action = params.get('action', 'chunk')
+            if action == 'chunk':
+                idx = int(params.get('idx', '0'))
+                chunk_b64 = params.get('d', '')
+                with _CHUNK_LOCK:
+                    buf = _UPLOAD_BUFFERS.setdefault(uid, {})
+                    buf[idx] = chunk_b64
+                return 200, {'ok': True, 'idx': idx}, 'application/json; charset=utf-8', None
+            if action == 'commit':
+                total = int(params.get('total', '0'))
+                kind = params.get('kind', 'gambar')
+                name = params.get('name', '')
+                with _CHUNK_LOCK:
+                    buf = _UPLOAD_BUFFERS.pop(uid, {})
+                if len(buf) != total or any(i not in buf for i in range(total)):
+                    raise InvalidUpload('Unggahan tidak lengkap; coba pilih file kembali.')
+                full_b64 = ''.join(buf[i] for i in range(total))
+                payload = base64.b64decode(full_b64)
+                meta = _stage_single_file(store, kind, name, payload)
+                return 201, meta, 'application/json; charset=utf-8', None
+            raise InvalidUpload('Aksi unggahan tidak dikenali.')
+
+        if api_path == '/api/create_job':
+            params = {k: v[0] for k, v in parse_qs(query_string, keep_blank_values=True).items()}
+            raw_json = params.get('payload', '')
+            try:
+                payload = json.loads(raw_json)
+            except Exception as exc:
+                raise InvalidUpload('Permintaan konversi tidak valid.') from exc
+            if not isinstance(payload, dict):
+                raise InvalidUpload('Permintaan konversi tidak valid.')
+            job_id = store.create_staged(payload)
+            return 202, {'id': job_id, 'status_url': f'/api/jobs/{job_id}'}, 'application/json; charset=utf-8', None
+
         if api_path == '/api/data':
             return 200, collect_data(store.root), 'application/json; charset=utf-8', None
         if api_path in {'/api/data/download/data_faktur.xlsx', '/api/data/download/data_faktur_csv.zip'}:
@@ -289,10 +364,11 @@ def _execute_get(store, api_path):
             raise FileNotFoundError('Berkas sumber tidak tersedia.')
         mime = 'application/pdf' if source == 'pdf' else 'image/' + IMAGE_FORMATS[file.suffix.lower()].lower()
         return 200, file.read_bytes(), mime, None
+    except InvalidUpload as exc:
+        code = 409 if api_path.endswith('/result') else 400
+        return code, {'error': str(exc)}, 'application/json; charset=utf-8', None
     except FileNotFoundError as exc:
         return 404, {'error': str(exc)}, 'application/json; charset=utf-8', None
-    except InvalidUpload as exc:
-        return 409, {'error': str(exc)}, 'application/json; charset=utf-8', None
     except Exception as exc:
         return 500, {'error': f'Gagal membaca sesi: {exc}'}, 'application/json; charset=utf-8', None
 
@@ -334,7 +410,6 @@ def register_tornado_routes(store):
     """Pasang route API pada Starlette (Streamlit >= 1.60) maupun Tornado (Streamlit lama)."""
     registered = False
 
-    # 1. Starlette (digunakan oleh Streamlit modern di Streamlit Community Cloud)
     try:
         import asyncio
         from starlette.applications import Starlette
@@ -358,22 +433,25 @@ def register_tornado_routes(store):
             return Response(content=body, status_code=code, media_type=content_type, headers=headers)
 
         async def zahir_starlette_endpoint(request):
-            if request.method == 'OPTIONS':
-                return _make_starlette_response(204, b'', 'text/plain')
-            subpath = request.path_params.get('api_path', '').lstrip('/')
-            api_path = '/api/' + subpath
-            if request.method in {'GET', 'HEAD'}:
-                code, body, ct, fname = await asyncio.to_thread(_execute_get, store, api_path)
-                return _make_starlette_response(code, body, ct, fname)
-            if request.method in {'POST', 'PUT'}:
-                raw_body = await request.body()
-                code, body, ct, fname = await asyncio.to_thread(_execute_post, store, api_path, raw_body, request.headers)
-                return _make_starlette_response(code, body, ct, fname)
-            return _make_starlette_response(405, {'error': 'Method not allowed'})
+            try:
+                if request.method == 'OPTIONS':
+                    return _make_starlette_response(204, b'', 'text/plain')
+                subpath = request.path_params.get('api_path', '').lstrip('/')
+                api_path = '/api/' + subpath
+                query_str = request.url.query or ''
+                if request.method in {'GET', 'HEAD'}:
+                    code, body, ct, fname = await asyncio.to_thread(_execute_get, store, api_path, query_str)
+                    return _make_starlette_response(code, body, ct, fname)
+                if request.method in {'POST', 'PUT'}:
+                    raw_body = await request.body()
+                    code, body, ct, fname = await asyncio.to_thread(_execute_post, store, api_path, raw_body, request.headers)
+                    return _make_starlette_response(code, body, ct, fname)
+                return _make_starlette_response(405, {'error': 'Method not allowed'})
+            except Exception as exc:
+                return _make_starlette_response(500, {'error': f'Server error: {exc}'})
 
         starlette_apps = [obj for obj in gc.get_objects() if isinstance(obj, Starlette)]
         for app in starlette_apps:
-            # Hapus route zahir_api versi sebelumnya agar hot-reload selalu memakai handler terbaru
             app.router.routes[:] = [
                 r for r in app.router.routes
                 if not getattr(r, '_is_zahir_route', False) and 'zahir_api' not in getattr(r, 'path', '')
@@ -403,62 +481,6 @@ def register_tornado_routes(store):
     except Exception:
         pass
 
-    # 2. Fallback Tornado (jika dijalankan pada Streamlit versi lama)
-    try:
-        from streamlit.web.server.component_request_handler import ComponentRequestHandler
-        if not getattr(ComponentRequestHandler, '_zahir_patched', False):
-            orig_get = ComponentRequestHandler.get
-            orig_xsrf = getattr(ComponentRequestHandler, 'check_xsrf_cookie', None)
-
-            def zahir_send(self, code, body, content_type='application/json; charset=utf-8', filename=None):
-                if not isinstance(body, bytes):
-                    body = json.dumps(body, ensure_ascii=False).encode('utf-8')
-                self.set_status(code)
-                self.set_header('Access-Control-Allow-Origin', '*')
-                self.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-                self.set_header('Access-Control-Allow-Headers', 'Content-Type, X-Local-Upload')
-                self.set_header('Content-Type', content_type)
-                self.set_header('Cache-Control', 'no-store')
-                self.set_header('X-Content-Type-Options', 'nosniff')
-                if filename:
-                    self.set_header('Content-Disposition', f'attachment; filename="{filename}"')
-                self.finish(body)
-
-            def comp_check_xsrf(self):
-                if 'zahir_api/' in (self.request.uri or ''):
-                    return
-                if orig_xsrf:
-                    return orig_xsrf(self)
-
-            def comp_options(self, path=''):
-                self.set_status(204)
-                self.set_header('Access-Control-Allow-Origin', '*')
-                self.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-                self.set_header('Access-Control-Allow-Headers', 'Content-Type, X-Local-Upload')
-                self.finish()
-
-            def comp_get(self, path=''):
-                if str(path).startswith('zahir_api/'):
-                    code, body, ct, fname = _execute_get(store, '/api/' + str(path)[len('zahir_api/'):])
-                    return self._zahir_send(code, body, ct, fname)
-                return orig_get(self, path)
-
-            def comp_post(self, path=''):
-                if str(path).startswith('zahir_api/'):
-                    code, body, ct, fname = _execute_post(store, '/api/' + str(path)[len('zahir_api/'):], self.request.body, self.request.headers)
-                    return self._zahir_send(code, body, ct, fname)
-                self.set_status(405)
-                self.finish()
-
-            ComponentRequestHandler._zahir_send = zahir_send
-            ComponentRequestHandler.check_xsrf_cookie = comp_check_xsrf
-            ComponentRequestHandler.options = comp_options
-            ComponentRequestHandler.get = comp_get
-            ComponentRequestHandler.post = comp_post
-            ComponentRequestHandler._zahir_patched = True
-            registered = True
-    except Exception:
-        pass
     return registered
 
 
@@ -500,7 +522,6 @@ def build_embedded_html(store):
 (() => {{
   const SERVER_ORIGIN = {server_origin_json};
 
-  // Cegah SecurityError saat history.replaceState dipanggil di dalam iframe srcdoc
   try {{
     const origReplace = history.replaceState.bind(history);
     history.replaceState = function(...args) {{
@@ -542,21 +563,29 @@ def build_embedded_html(store):
     return origins;
   }}
 
+  function randomHex32() {{
+    const arr = new Uint8Array(16);
+    crypto.getRandomValues(arr);
+    return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+  }}
+
+  function arrayBufferToBase64(buffer) {{
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {{
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    }}
+    return btoa(binary);
+  }}
+
   let activeGetPrefix = null;
-  let activePostPrefix = null;
   const origFetch = window.fetch.bind(window);
 
-  async function callBackend(apiPath, options = {{}}) {{
-    const suffix = apiPath.startsWith('/api/') ? apiPath.slice(4) : apiPath;
-    const isPost = (options.method || 'GET').toUpperCase() === 'POST';
-    const reqOptions = {{ ...options }};
-    if (isPost) {{
-      reqOptions.method = 'PUT';
-    }}
-    const cachedPrefix = isPost ? activePostPrefix : activeGetPrefix;
-    if (cachedPrefix) {{
+  async function callGetBackend(suffixWithQuery) {{
+    if (activeGetPrefix) {{
       try {{
-        const resp = await origFetch(cachedPrefix + suffix, reqOptions);
+        const resp = await origFetch(activeGetPrefix + suffixWithQuery, {{ method: 'GET' }});
         const ct = resp.headers.get('content-type') || '';
         const isZahir = resp.headers.get('x-zahir-api') === '1';
         if (isZahir || ct.includes('application/json') || ct.includes('application/zip') || ct.includes('spreadsheetml')) {{
@@ -567,28 +596,19 @@ def build_embedded_html(store):
     const origins = resolveOrigins();
     const prefixes = [];
     for (const origin of origins) {{
-      if (isPost) {{
-        prefixes.push(`${{origin}}/~/+/_stcore/upload_file/zahir_api`);
-        prefixes.push(`${{origin}}/_stcore/upload_file/zahir_api`);
-        prefixes.push(`${{origin}}/~/+/component/zahir_api`);
-        prefixes.push(`${{origin}}/component/zahir_api`);
-        prefixes.push(`${{origin}}/api`);
-      }} else {{
-        prefixes.push(`${{origin}}/~/+/component/zahir_api`);
-        prefixes.push(`${{origin}}/component/zahir_api`);
-        prefixes.push(`${{origin}}/~/+/media/zahir_api`);
-        prefixes.push(`${{origin}}/media/zahir_api`);
-        prefixes.push(`${{origin}}/api`);
-      }}
+      prefixes.push(`${{origin}}/~/+/component/zahir_api`);
+      prefixes.push(`${{origin}}/component/zahir_api`);
+      prefixes.push(`${{origin}}/~/+/media/zahir_api`);
+      prefixes.push(`${{origin}}/media/zahir_api`);
+      prefixes.push(`${{origin}}/api`);
     }}
     for (const prefix of prefixes) {{
       try {{
-        const resp = await origFetch(prefix + suffix, reqOptions);
+        const resp = await origFetch(prefix + suffixWithQuery, {{ method: 'GET' }});
         const ct = resp.headers.get('content-type') || '';
         const isZahir = resp.headers.get('x-zahir-api') === '1';
         if (isZahir || ct.includes('application/json') || ct.includes('application/zip') || ct.includes('spreadsheetml')) {{
-          if (isPost) activePostPrefix = prefix;
-          else activeGetPrefix = prefix;
+          activeGetPrefix = prefix;
           return resp;
         }}
       }} catch (_) {{}}
@@ -596,15 +616,53 @@ def build_embedded_html(store):
     throw new Error('Tidak dapat menghubungi server ekstraksi backend.');
   }}
 
-  window.fetch = async (input, options) => {{
+  async function uploadViaGetChunks(formData) {{
+    let kind = 'gambar', file = null;
+    for (const [k, v] of formData.entries()) {{
+      kind = k;
+      file = v;
+      break;
+    }}
+    if (!file) throw new Error('Pilih dokumen gambar atau PDF yang valid.');
+    const buf = await file.arrayBuffer();
+    const b64 = arrayBufferToBase64(buf);
+    const chunkSize = 6000;
+    const chunks = [];
+    for (let i = 0; i < b64.length; i += chunkSize) {{
+      chunks.push(b64.slice(i, i + chunkSize));
+    }}
+    if (chunks.length === 0) chunks.push('');
+    const uid = randomHex32();
+    const batchSize = 6;
+    for (let i = 0; i < chunks.length; i += batchSize) {{
+      const slice = chunks.slice(i, i + batchSize);
+      await Promise.all(slice.map((c, offset) => {{
+        const idx = i + offset;
+        const q = `/upload_chunk?action=chunk&uid=${{uid}}&idx=${{idx}}&d=${{encodeURIComponent(c)}}`;
+        return callGetBackend(q);
+      }}));
+    }}
+    const commitQ = `/upload_chunk?action=commit&uid=${{uid}}&total=${{chunks.length}}&kind=${{encodeURIComponent(kind)}}&name=${{encodeURIComponent(file.name)}}`;
+    return callGetBackend(commitQ);
+  }}
+
+  window.fetch = async (input, options = {{}}) => {{
     const url = typeof input === 'string' ? input : input.url;
     if (typeof url === 'string' && url.startsWith('/api/')) {{
-      return callBackend(url, options);
+      const method = (options.method || 'GET').toUpperCase();
+      const suffix = url.slice(4);
+      if (method === 'POST' && url === '/api/uploads' && options.body instanceof FormData) {{
+        return uploadViaGetChunks(options.body);
+      }}
+      if (method === 'POST' && url === '/api/jobs') {{
+        const payloadStr = typeof options.body === 'string' ? options.body : JSON.stringify(options.body || {{}});
+        return callGetBackend(`/create_job?payload=${{encodeURIComponent(payloadStr)}}`);
+      }}
+      return callGetBackend(suffix);
     }}
     return origFetch(input, options);
   }};
 
-  // Tangani klik tautan unduhan (<a download>) agar mengunduh lewat Blob dari backend
   document.addEventListener('click', async (event) => {{
     const link = event.target.closest('a');
     if (!link) return;
@@ -612,7 +670,7 @@ def build_embedded_html(store):
     if (!rawHref.startsWith('/api/')) return;
     event.preventDefault();
     try {{
-      const resp = await callBackend(rawHref, {{ method: 'GET' }});
+      const resp = await callGetBackend(rawHref.slice(4));
       if (!resp.ok) throw new Error(`Gagal mengunduh (${{resp.status}})`);
       const blob = await resp.blob();
       const blobUrl = URL.createObjectURL(blob);
@@ -680,6 +738,7 @@ def main():
         unsafe_allow_html=True,
     )
     store = get_runtime()
+    register_tornado_routes(store)
     components.html(build_embedded_html(store), height=900, scrolling=True)
 
 
