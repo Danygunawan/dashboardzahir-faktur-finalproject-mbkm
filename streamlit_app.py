@@ -346,7 +346,7 @@ def register_tornado_routes(store):
                 body = json.dumps(body, ensure_ascii=False).encode('utf-8')
             headers = {
                 'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS, HEAD',
                 'Access-Control-Allow-Headers': 'Content-Type, X-Local-Upload',
                 'Access-Control-Expose-Headers': 'X-Zahir-Api, Content-Disposition',
                 'X-Zahir-Api': '1',
@@ -365,7 +365,7 @@ def register_tornado_routes(store):
             if request.method in {'GET', 'HEAD'}:
                 code, body, ct, fname = await asyncio.to_thread(_execute_get, store, api_path)
                 return _make_starlette_response(code, body, ct, fname)
-            if request.method == 'POST':
+            if request.method in {'POST', 'PUT'}:
                 raw_body = await request.body()
                 code, body, ct, fname = await asyncio.to_thread(_execute_post, store, api_path, raw_body, request.headers)
                 return _make_starlette_response(code, body, ct, fname)
@@ -373,7 +373,7 @@ def register_tornado_routes(store):
 
         starlette_apps = [obj for obj in gc.get_objects() if isinstance(obj, Starlette)]
         for app in starlette_apps:
-            if not getattr(app, '_zahir_starlette_patched', False):
+            if not getattr(app, '_zahir_starlette_patched_v2', False):
                 candidate_prefixes = {'/component/zahir_api', '/media/zahir_api', '/_stcore/zahir_api', '/api'}
                 for existing_route in list(app.router.routes):
                     rpath = getattr(existing_route, 'path', '')
@@ -387,10 +387,10 @@ def register_tornado_routes(store):
                         Route(
                             f'{prefix}/{{api_path:path}}',
                             zahir_starlette_endpoint,
-                            methods=['GET', 'POST', 'OPTIONS', 'HEAD'],
+                            methods=['GET', 'POST', 'PUT', 'OPTIONS', 'HEAD'],
                         ),
                     )
-                app._zahir_starlette_patched = True
+                app._zahir_starlette_patched_v2 = True
                 registered = True
     except Exception:
         pass
@@ -537,13 +537,20 @@ def build_embedded_html(store):
   let activePrefix = null;
   const origFetch = window.fetch.bind(window);
 
-  async function callBackend(apiPath, options) {{
+  async function callBackend(apiPath, options = {{}}) {{
     const suffix = apiPath.startsWith('/api/') ? apiPath.slice(4) : apiPath;
+    const reqOptions = {{ ...options }};
+    if ((reqOptions.method || 'GET').toUpperCase() === 'POST') {{
+      reqOptions.method = 'PUT';
+    }}
     if (activePrefix) {{
       try {{
-        const resp = await origFetch(activePrefix + suffix, options);
+        const resp = await origFetch(activePrefix + suffix, reqOptions);
         const ct = resp.headers.get('content-type') || '';
-        if (!ct.includes('text/html')) return resp;
+        const isZahir = resp.headers.get('x-zahir-api') === '1';
+        if (isZahir || ct.includes('application/json') || ct.includes('application/zip') || ct.includes('spreadsheetml')) {{
+          return resp;
+        }}
       }} catch (_) {{}}
     }}
     const origins = resolveOrigins();
@@ -557,7 +564,7 @@ def build_embedded_html(store):
     }}
     for (const prefix of prefixes) {{
       try {{
-        const resp = await origFetch(prefix + suffix, options);
+        const resp = await origFetch(prefix + suffix, reqOptions);
         const ct = resp.headers.get('content-type') || '';
         const isZahir = resp.headers.get('x-zahir-api') === '1';
         if (isZahir || ct.includes('application/json') || ct.includes('application/zip') || ct.includes('spreadsheetml')) {{
