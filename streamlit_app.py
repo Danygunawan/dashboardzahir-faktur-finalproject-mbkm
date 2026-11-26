@@ -243,109 +243,178 @@ class CloudJobStore(JobStore):
                 atomic_json(state_path, state)
 
 
-def register_tornado_routes(store):
-    """Pasang handler API langsung pada ComponentRequestHandler dan router Tornado Streamlit."""
-    def handle_get(handler, api_path):
-        try:
-            if api_path == '/api/health':
-                return handler._zahir_send(200, {'status': 'ok', 'tahap': 1})
-            if api_path == '/api/data':
-                return handler._zahir_send(200, collect_data(store.root))
-            if api_path in {'/api/data/download/data_faktur.xlsx', '/api/data/download/data_faktur_csv.zip'}:
-                data = collect_data(store.root)
-                if api_path.endswith('.xlsx'):
-                    return handler._zahir_send(200, data_excel_bytes(data), DOWNLOADS['hasil_faktur.xlsx'], 'data_faktur.xlsx')
-                return handler._zahir_send(200, data_csv_zip(data), 'application/zip', 'data_faktur_csv.zip')
-            match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(?:/(result|download/([^/]+)|source/(gambar|pdf)))?', api_path)
-            if not match:
-                raise FileNotFoundError('Halaman tidak ditemukan.')
-            job_id, action, download, source = match.groups()
-            if action is None:
-                return handler._zahir_send(200, store.status(job_id))
-            if action == 'result':
-                return handler._zahir_send(200, store.result(job_id))
-            folder = store.folder(job_id)
-            if download:
-                if download not in DOWNLOADS or not store.status(job_id)['terminal']:
-                    raise FileNotFoundError('Unduhan tidak tersedia.')
-                export = store.export_folder(folder)
-                if export is None:
-                    raise FileNotFoundError('Unduhan tidak tersedia.')
-                if download == 'hasil_faktur.xlsx':
-                    body = session_excel_bytes(export)
-                elif download == 'hasil_faktur_csv.zip':
-                    body = session_csv_zip(export)
-                elif download.endswith('.xlsx'):
-                    table = download.removesuffix('.xlsx')
-                    body = excel_bytes(export / (table + '.csv'), TABLES[table])
-                else:
-                    body = (export / download).read_bytes()
-                return handler._zahir_send(200, body, DOWNLOADS[download], download)
-            uploads = read_json(folder / 'manifest.json')['dokumen']
-            entry = next((e for e in uploads if Path(e['path_relatif']).parts[0] == source), None)
-            if entry is None:
-                raise FileNotFoundError('Berkas sumber tidak tersedia.')
-            file = Path(entry['path_sumber']).resolve()
-            if not file.is_relative_to((folder / 'unggahan').resolve()):
-                raise FileNotFoundError('Berkas sumber tidak tersedia.')
-            mime = 'application/pdf' if source == 'pdf' else 'image/' + IMAGE_FORMATS[file.suffix.lower()].lower()
-            return handler._zahir_send(200, file.read_bytes(), mime)
-        except FileNotFoundError as exc:
-            return handler._zahir_send(404, {'error': str(exc)})
-        except InvalidUpload as exc:
-            return handler._zahir_send(409, {'error': str(exc)})
-        except Exception as exc:
-            return handler._zahir_send(500, {'error': f'Gagal membaca sesi: {exc}'})
-
-    def handle_post(handler, api_path):
-        try:
-            body = handler.request.body or b''
-            if not 0 < len(body) <= MAX_BODY:
-                return handler._zahir_send(413, {'error': 'Permintaan terlalu besar. Unggah setiap file secara terpisah (maksimal 25 MB per file).'})
-            if handler.request.headers.get('X-Local-Upload') != '1':
-                return handler._zahir_send(403, {'error': 'Unggah melalui halaman web lokal.'})
-            if api_path not in {'/api/jobs', '/api/uploads'}:
-                return handler._zahir_send(404, {'error': 'Endpoint tidak ditemukan.'})
-            content_type = handler.request.headers.get('Content-Type', '')
-            if api_path == '/api/uploads':
-                files = parse_upload(content_type, body)
-                return handler._zahir_send(201, store.stage(files))
-            if content_type.split(';')[0] == 'application/json':
-                try:
-                    payload = json.loads(body.decode('utf-8'))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise InvalidUpload('Permintaan konversi tidak valid.') from exc
-                if not isinstance(payload, dict):
-                    raise InvalidUpload('Permintaan konversi tidak valid.')
-                job_id = store.create_staged(payload)
+def _execute_get(store, api_path):
+    """Jalankan logika GET API web_lokal dan kembalikan (status_code, body, content_type, filename)."""
+    try:
+        if api_path == '/api/health':
+            return 200, {'status': 'ok', 'tahap': 1}, 'application/json; charset=utf-8', None
+        if api_path == '/api/data':
+            return 200, collect_data(store.root), 'application/json; charset=utf-8', None
+        if api_path in {'/api/data/download/data_faktur.xlsx', '/api/data/download/data_faktur_csv.zip'}:
+            data = collect_data(store.root)
+            if api_path.endswith('.xlsx'):
+                return 200, data_excel_bytes(data), DOWNLOADS['hasil_faktur.xlsx'], 'data_faktur.xlsx'
+            return 200, data_csv_zip(data), 'application/zip', 'data_faktur_csv.zip'
+        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(?:/(result|download/([^/]+)|source/(gambar|pdf)))?', api_path)
+        if not match:
+            raise FileNotFoundError('Halaman tidak ditemukan.')
+        job_id, action, download, source = match.groups()
+        if action is None:
+            return 200, store.status(job_id), 'application/json; charset=utf-8', None
+        if action == 'result':
+            return 200, store.result(job_id), 'application/json; charset=utf-8', None
+        folder = store.folder(job_id)
+        if download:
+            if download not in DOWNLOADS or not store.status(job_id)['terminal']:
+                raise FileNotFoundError('Unduhan tidak tersedia.')
+            export = store.export_folder(folder)
+            if export is None:
+                raise FileNotFoundError('Unduhan tidak tersedia.')
+            if download == 'hasil_faktur.xlsx':
+                body = session_excel_bytes(export)
+            elif download == 'hasil_faktur_csv.zip':
+                body = session_csv_zip(export)
+            elif download.endswith('.xlsx'):
+                table = download.removesuffix('.xlsx')
+                body = excel_bytes(export / (table + '.csv'), TABLES[table])
             else:
-                files = parse_upload(content_type, body)
-                job_id = store.create(files)
-            return handler._zahir_send(202, {'id': job_id, 'status_url': f'/api/jobs/{job_id}'})
-        except InvalidUpload as exc:
-            return handler._zahir_send(400, {'error': str(exc)})
-        except Exception as exc:
-            return handler._zahir_send(500, {'error': f'Gagal menyimpan unggahan: {exc}'})
+                body = (export / download).read_bytes()
+            return 200, body, DOWNLOADS[download], download
+        uploads = read_json(folder / 'manifest.json')['dokumen']
+        entry = next((e for e in uploads if Path(e['path_relatif']).parts[0] == source), None)
+        if entry is None:
+            raise FileNotFoundError('Berkas sumber tidak tersedia.')
+        file = Path(entry['path_sumber']).resolve()
+        if not file.is_relative_to((folder / 'unggahan').resolve()):
+            raise FileNotFoundError('Berkas sumber tidak tersedia.')
+        mime = 'application/pdf' if source == 'pdf' else 'image/' + IMAGE_FORMATS[file.suffix.lower()].lower()
+        return 200, file.read_bytes(), mime, None
+    except FileNotFoundError as exc:
+        return 404, {'error': str(exc)}, 'application/json; charset=utf-8', None
+    except InvalidUpload as exc:
+        return 409, {'error': str(exc)}, 'application/json; charset=utf-8', None
+    except Exception as exc:
+        return 500, {'error': f'Gagal membaca sesi: {exc}'}, 'application/json; charset=utf-8', None
 
-    def zahir_send(self, code, body, content_type='application/json; charset=utf-8', filename=None):
-        if not isinstance(body, bytes):
-            body = json.dumps(body, ensure_ascii=False).encode('utf-8')
-        self.set_status(code)
-        self.set_header('Access-Control-Allow-Origin', '*')
-        self.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.set_header('Access-Control-Allow-Headers', 'Content-Type, X-Local-Upload')
-        self.set_header('Content-Type', content_type)
-        self.set_header('Cache-Control', 'no-store')
-        self.set_header('X-Content-Type-Options', 'nosniff')
-        if filename:
-            self.set_header('Content-Disposition', f'attachment; filename="{filename}"')
-        self.finish(body)
 
+def _execute_post(store, api_path, body, headers):
+    """Jalankan logika POST API web_lokal dan kembalikan (status_code, body, content_type, filename)."""
+    try:
+        body = body or b''
+        if not 0 < len(body) <= MAX_BODY:
+            return 413, {'error': 'Permintaan terlalu besar. Unggah setiap file secara terpisah (maksimal 25 MB per file).'}, 'application/json; charset=utf-8', None
+        x_local = headers.get('X-Local-Upload') or headers.get('x-local-upload')
+        if x_local != '1':
+            return 403, {'error': 'Unggah melalui halaman web lokal.'}, 'application/json; charset=utf-8', None
+        if api_path not in {'/api/jobs', '/api/uploads'}:
+            return 404, {'error': 'Endpoint tidak ditemukan.'}, 'application/json; charset=utf-8', None
+        content_type = headers.get('Content-Type') or headers.get('content-type') or ''
+        if api_path == '/api/uploads':
+            files = parse_upload(content_type, body)
+            return 201, store.stage(files), 'application/json; charset=utf-8', None
+        if content_type.split(';')[0].strip().lower() == 'application/json':
+            try:
+                payload = json.loads(body.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise InvalidUpload('Permintaan konversi tidak valid.') from exc
+            if not isinstance(payload, dict):
+                raise InvalidUpload('Permintaan konversi tidak valid.')
+            job_id = store.create_staged(payload)
+        else:
+            files = parse_upload(content_type, body)
+            job_id = store.create(files)
+        return 202, {'id': job_id, 'status_url': f'/api/jobs/{job_id}'}, 'application/json; charset=utf-8', None
+    except InvalidUpload as exc:
+        return 400, {'error': str(exc)}, 'application/json; charset=utf-8', None
+    except Exception as exc:
+        return 500, {'error': f'Gagal menyimpan unggahan: {exc}'}, 'application/json; charset=utf-8', None
+
+
+def register_tornado_routes(store):
+    """Pasang route API pada Starlette (Streamlit >= 1.60) maupun Tornado (Streamlit lama)."""
+    registered = False
+
+    # 1. Starlette (digunakan oleh Streamlit modern di Streamlit Community Cloud)
+    try:
+        import asyncio
+        from starlette.applications import Starlette
+        from starlette.responses import Response
+        from starlette.routing import Route
+
+        def _make_starlette_response(code, body, content_type='application/json; charset=utf-8', filename=None):
+            if not isinstance(body, bytes):
+                body = json.dumps(body, ensure_ascii=False).encode('utf-8')
+            headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
+                'Access-Control-Allow-Headers': 'Content-Type, X-Local-Upload',
+                'Access-Control-Expose-Headers': 'X-Zahir-Api, Content-Disposition',
+                'X-Zahir-Api': '1',
+                'Cache-Control': 'no-store',
+                'X-Content-Type-Options': 'nosniff',
+            }
+            if filename:
+                headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return Response(content=body, status_code=code, media_type=content_type, headers=headers)
+
+        async def zahir_starlette_endpoint(request):
+            if request.method == 'OPTIONS':
+                return _make_starlette_response(204, b'', 'text/plain')
+            subpath = request.path_params.get('api_path', '').lstrip('/')
+            api_path = '/api/' + subpath
+            if request.method in {'GET', 'HEAD'}:
+                code, body, ct, fname = await asyncio.to_thread(_execute_get, store, api_path)
+                return _make_starlette_response(code, body, ct, fname)
+            if request.method == 'POST':
+                raw_body = await request.body()
+                code, body, ct, fname = await asyncio.to_thread(_execute_post, store, api_path, raw_body, request.headers)
+                return _make_starlette_response(code, body, ct, fname)
+            return _make_starlette_response(405, {'error': 'Method not allowed'})
+
+        starlette_apps = [obj for obj in gc.get_objects() if isinstance(obj, Starlette)]
+        for app in starlette_apps:
+            if not getattr(app, '_zahir_starlette_patched', False):
+                candidate_prefixes = {'/component/zahir_api', '/media/zahir_api', '/_stcore/zahir_api', '/api'}
+                for existing_route in list(app.router.routes):
+                    rpath = getattr(existing_route, 'path', '')
+                    if '/{' in rpath:
+                        base_prefix = rpath.split('/{', 1)[0].rstrip('/')
+                        if base_prefix:
+                            candidate_prefixes.add(f'{base_prefix}/zahir_api')
+                for prefix in sorted(candidate_prefixes):
+                    app.router.routes.insert(
+                        0,
+                        Route(
+                            f'{prefix}/{{api_path:path}}',
+                            zahir_starlette_endpoint,
+                            methods=['GET', 'POST', 'OPTIONS', 'HEAD'],
+                        ),
+                    )
+                app._zahir_starlette_patched = True
+                registered = True
+    except Exception:
+        pass
+
+    # 2. Fallback Tornado (jika dijalankan pada Streamlit versi lama)
     try:
         from streamlit.web.server.component_request_handler import ComponentRequestHandler
         if not getattr(ComponentRequestHandler, '_zahir_patched', False):
             orig_get = ComponentRequestHandler.get
             orig_xsrf = getattr(ComponentRequestHandler, 'check_xsrf_cookie', None)
+
+            def zahir_send(self, code, body, content_type='application/json; charset=utf-8', filename=None):
+                if not isinstance(body, bytes):
+                    body = json.dumps(body, ensure_ascii=False).encode('utf-8')
+                self.set_status(code)
+                self.set_header('Access-Control-Allow-Origin', '*')
+                self.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self.set_header('Access-Control-Allow-Headers', 'Content-Type, X-Local-Upload')
+                self.set_header('Content-Type', content_type)
+                self.set_header('Cache-Control', 'no-store')
+                self.set_header('X-Content-Type-Options', 'nosniff')
+                if filename:
+                    self.set_header('Content-Disposition', f'attachment; filename="{filename}"')
+                self.finish(body)
 
             def comp_check_xsrf(self):
                 if 'zahir_api/' in (self.request.uri or ''):
@@ -354,24 +423,22 @@ def register_tornado_routes(store):
                     return orig_xsrf(self)
 
             def comp_options(self, path=''):
-                if str(path).startswith('zahir_api/'):
-                    self.set_status(204)
-                    self.set_header('Access-Control-Allow-Origin', '*')
-                    self.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-                    self.set_header('Access-Control-Allow-Headers', 'Content-Type, X-Local-Upload')
-                    self.finish()
-                    return
                 self.set_status(204)
+                self.set_header('Access-Control-Allow-Origin', '*')
+                self.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self.set_header('Access-Control-Allow-Headers', 'Content-Type, X-Local-Upload')
                 self.finish()
 
             def comp_get(self, path=''):
                 if str(path).startswith('zahir_api/'):
-                    return handle_get(self, '/api/' + str(path)[len('zahir_api/'):])
+                    code, body, ct, fname = _execute_get(store, '/api/' + str(path)[len('zahir_api/'):])
+                    return self._zahir_send(code, body, ct, fname)
                 return orig_get(self, path)
 
             def comp_post(self, path=''):
                 if str(path).startswith('zahir_api/'):
-                    return handle_post(self, '/api/' + str(path)[len('zahir_api/'):])
+                    code, body, ct, fname = _execute_post(store, '/api/' + str(path)[len('zahir_api/'):], self.request.body, self.request.headers)
+                    return self._zahir_send(code, body, ct, fname)
                 self.set_status(405)
                 self.finish()
 
@@ -381,9 +448,10 @@ def register_tornado_routes(store):
             ComponentRequestHandler.get = comp_get
             ComponentRequestHandler.post = comp_post
             ComponentRequestHandler._zahir_patched = True
+            registered = True
     except Exception:
         pass
-    return True
+    return registered
 
 
 @st.cache_resource
@@ -491,7 +559,8 @@ def build_embedded_html(store):
       try {{
         const resp = await origFetch(prefix + suffix, options);
         const ct = resp.headers.get('content-type') || '';
-        if (!ct.includes('text/html')) {{
+        const isZahir = resp.headers.get('x-zahir-api') === '1';
+        if (isZahir || ct.includes('application/json') || ct.includes('application/zip') || ct.includes('spreadsheetml')) {{
           activePrefix = prefix;
           return resp;
         }}
