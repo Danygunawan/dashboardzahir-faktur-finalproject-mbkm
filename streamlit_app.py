@@ -383,6 +383,18 @@ def build_embedded_html(store):
 
     bridge_js = f"""
 (() => {{
+  // Cegah SecurityError saat history.replaceState dipanggil di dalam iframe srcdoc
+  try {{
+    const origReplace = history.replaceState.bind(history);
+    history.replaceState = function(...args) {{
+      try {{ return origReplace(...args); }} catch (_) {{}}
+    }};
+    const origPush = history.pushState.bind(history);
+    history.pushState = function(...args) {{
+      try {{ return origPush(...args); }} catch (_) {{}}
+    }};
+  }} catch (_) {{}}
+
   const SNAPSHOT = {bridge_payload};
   const stagedUploads = new Map();
   const localJobs = new Map();
@@ -537,36 +549,64 @@ def build_embedded_html(store):
         }}
       }};
       localJobs.set(jobId, {{ status: stObj, result: resObj }});
+
+      // Tambahkan juga ke SNAPSHOT.data agar tab Data langsung ter-update
+      fakturRows.forEach(r => SNAPSHOT.data.faktur.baris.push({{ id_sesi: jobId, ...r }}));
+      detailRows.forEach(r => SNAPSHOT.data.detail_faktur.baris.push({{ id_sesi: jobId, ...r }}));
+
       return jsonResponse(202, {{ id: jobId, status_url: `/api/jobs/${{jobId}}` }});
     }}
     return jsonResponse(404, {{ error: 'Endpoint tidak ditemukan.' }});
+  }}
+
+  function resolveOriginAndBase() {{
+    try {{
+      if (window.parent && window.parent.location && window.parent.location.origin && window.parent.location.origin !== 'null') {{
+        return {{
+          origin: window.parent.location.origin,
+          base: window.parent.location.pathname.replace(/\\/+$/, '')
+        }};
+      }}
+    }} catch (_) {{}}
+    if (document.referrer) {{
+      try {{
+        const ref = new URL(document.referrer);
+        return {{ origin: ref.origin, base: ref.pathname.replace(/\\/+$/, '') }};
+      }} catch (_) {{}}
+    }}
+    if (window.location.origin && window.location.origin !== 'null' && !window.location.href.startsWith('about:')) {{
+      return {{ origin: window.location.origin, base: window.location.pathname.replace(/\\/+$/, '') }};
+    }}
+    return {{ origin: '', base: '' }};
   }}
 
   const origFetch = window.fetch.bind(window);
   window.fetch = async (input, options) => {{
     const url = typeof input === 'string' ? input : input.url;
     if (typeof url === 'string' && url.startsWith('/api/')) {{
-      const basePath = (window.parent && window.parent.location ? window.parent.location.pathname : window.location.pathname).replace(/\\/+$/, '');
-      const candidates = [
-        `${{basePath}}/_stcore/zahir_api${{url.slice(4)}}`,
-        `${{basePath}}${{url}}`
-      ];
-      for (const candidate of candidates) {{
-        try {{
-          const resp = await origFetch(candidate, options);
-          const ct = resp.headers.get('content-type') || '';
-          if (ct.includes('application/json')) {{
-            if (resp.ok && url === '/api/data') {{
-              const cloned = await resp.clone().json();
-              if (cloned && cloned.unduhan) {{
-                cloned.unduhan.xlsx = dataXlsxBlobUrl;
-                cloned.unduhan.csv = dataZipBlobUrl;
-                return jsonResponse(200, cloned);
+      const {{ origin, base }} = resolveOriginAndBase();
+      if (origin) {{
+        const candidates = [
+          `${{origin}}${{base}}/_stcore/zahir_api${{url.slice(4)}}`,
+          `${{origin}}${{base}}${{url}}`
+        ];
+        for (const candidate of candidates) {{
+          try {{
+            const resp = await origFetch(candidate, options);
+            const ct = resp.headers.get('content-type') || '';
+            if (ct.includes('application/json')) {{
+              if (resp.ok && url === '/api/data') {{
+                const cloned = await resp.clone().json();
+                if (cloned && cloned.unduhan) {{
+                  cloned.unduhan.xlsx = dataXlsxBlobUrl;
+                  cloned.unduhan.csv = dataZipBlobUrl;
+                  return jsonResponse(200, cloned);
+                }}
               }}
+              return resp;
             }}
-            return resp;
-          }}
-        }} catch (_) {{}}
+          }} catch (_) {{}}
+        }}
       }}
       return fallbackApi(url, options);
     }}
@@ -578,10 +618,9 @@ def build_embedded_html(store):
     html = html.replace('<link rel="stylesheet" href="/style.css">', f'<style>{css}</style>')
     html = html.replace('<script src="/theme.js"></script>', f'<script>{theme_js}</script>')
     html = html.replace('src="/zahir-one.png"', f'src="data:image/png;base64,{logo_b64}"')
-    html = html.replace(
-        '<script src="/app.js" defer></script>',
-        f'<script>{bridge_js}\n{app_js}</script>',
-    )
+    # Hapus tag script app.js dari <head> dan letakkan di akhir <body> agar seluruh elemen DOM sudah siap
+    html = html.replace('<script src="/app.js" defer></script>', '')
+    html = html.replace('</body>', f'<script>{bridge_js}\n{app_js}</script>\n</body>')
     return html
 
 
