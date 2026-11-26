@@ -373,25 +373,33 @@ def register_tornado_routes(store):
 
         starlette_apps = [obj for obj in gc.get_objects() if isinstance(obj, Starlette)]
         for app in starlette_apps:
-            if not getattr(app, '_zahir_starlette_patched_v2', False):
-                candidate_prefixes = {'/component/zahir_api', '/media/zahir_api', '/_stcore/zahir_api', '/api'}
-                for existing_route in list(app.router.routes):
-                    rpath = getattr(existing_route, 'path', '')
-                    if '/{' in rpath:
-                        base_prefix = rpath.split('/{', 1)[0].rstrip('/')
-                        if base_prefix:
-                            candidate_prefixes.add(f'{base_prefix}/zahir_api')
-                for prefix in sorted(candidate_prefixes):
-                    app.router.routes.insert(
-                        0,
-                        Route(
-                            f'{prefix}/{{api_path:path}}',
-                            zahir_starlette_endpoint,
-                            methods=['GET', 'POST', 'PUT', 'OPTIONS', 'HEAD'],
-                        ),
-                    )
-                app._zahir_starlette_patched_v2 = True
-                registered = True
+            # Hapus route zahir_api versi sebelumnya agar hot-reload selalu memakai handler terbaru
+            app.router.routes[:] = [
+                r for r in app.router.routes
+                if not getattr(r, '_is_zahir_route', False) and 'zahir_api' not in getattr(r, 'path', '')
+            ]
+            candidate_prefixes = {
+                '/_stcore/upload_file/zahir_api',
+                '/component/zahir_api',
+                '/media/zahir_api',
+                '/_stcore/zahir_api',
+                '/api',
+            }
+            for existing_route in list(app.router.routes):
+                rpath = getattr(existing_route, 'path', '')
+                if '/{' in rpath:
+                    base_prefix = rpath.split('/{', 1)[0].rstrip('/')
+                    if base_prefix:
+                        candidate_prefixes.add(f'{base_prefix}/zahir_api')
+            for prefix in sorted(candidate_prefixes):
+                new_route = Route(
+                    f'{prefix}/{{api_path:path}}',
+                    zahir_starlette_endpoint,
+                    methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD'],
+                )
+                new_route._is_zahir_route = True
+                app.router.routes.insert(0, new_route)
+            registered = True
     except Exception:
         pass
 
@@ -534,18 +542,21 @@ def build_embedded_html(store):
     return origins;
   }}
 
-  let activePrefix = null;
+  let activeGetPrefix = null;
+  let activePostPrefix = null;
   const origFetch = window.fetch.bind(window);
 
   async function callBackend(apiPath, options = {{}}) {{
     const suffix = apiPath.startsWith('/api/') ? apiPath.slice(4) : apiPath;
+    const isPost = (options.method || 'GET').toUpperCase() === 'POST';
     const reqOptions = {{ ...options }};
-    if ((reqOptions.method || 'GET').toUpperCase() === 'POST') {{
+    if (isPost) {{
       reqOptions.method = 'PUT';
     }}
-    if (activePrefix) {{
+    const cachedPrefix = isPost ? activePostPrefix : activeGetPrefix;
+    if (cachedPrefix) {{
       try {{
-        const resp = await origFetch(activePrefix + suffix, reqOptions);
+        const resp = await origFetch(cachedPrefix + suffix, reqOptions);
         const ct = resp.headers.get('content-type') || '';
         const isZahir = resp.headers.get('x-zahir-api') === '1';
         if (isZahir || ct.includes('application/json') || ct.includes('application/zip') || ct.includes('spreadsheetml')) {{
@@ -556,11 +567,19 @@ def build_embedded_html(store):
     const origins = resolveOrigins();
     const prefixes = [];
     for (const origin of origins) {{
-      prefixes.push(`${{origin}}/~/+/component/zahir_api`);
-      prefixes.push(`${{origin}}/component/zahir_api`);
-      prefixes.push(`${{origin}}/~/+/media/zahir_api`);
-      prefixes.push(`${{origin}}/media/zahir_api`);
-      prefixes.push(`${{origin}}/api`);
+      if (isPost) {{
+        prefixes.push(`${{origin}}/~/+/_stcore/upload_file/zahir_api`);
+        prefixes.push(`${{origin}}/_stcore/upload_file/zahir_api`);
+        prefixes.push(`${{origin}}/~/+/component/zahir_api`);
+        prefixes.push(`${{origin}}/component/zahir_api`);
+        prefixes.push(`${{origin}}/api`);
+      }} else {{
+        prefixes.push(`${{origin}}/~/+/component/zahir_api`);
+        prefixes.push(`${{origin}}/component/zahir_api`);
+        prefixes.push(`${{origin}}/~/+/media/zahir_api`);
+        prefixes.push(`${{origin}}/media/zahir_api`);
+        prefixes.push(`${{origin}}/api`);
+      }}
     }}
     for (const prefix of prefixes) {{
       try {{
@@ -568,7 +587,8 @@ def build_embedded_html(store):
         const ct = resp.headers.get('content-type') || '';
         const isZahir = resp.headers.get('x-zahir-api') === '1';
         if (isZahir || ct.includes('application/json') || ct.includes('application/zip') || ct.includes('spreadsheetml')) {{
-          activePrefix = prefix;
+          if (isPost) activePostPrefix = prefix;
+          else activeGetPrefix = prefix;
           return resp;
         }}
       }} catch (_) {{}}
