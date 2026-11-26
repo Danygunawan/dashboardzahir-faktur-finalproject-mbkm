@@ -63,6 +63,7 @@
 !/scripts/prepare_models.py
 !/scripts/seed_demo.py
 !/scripts/test_ci.py
+!/streamlit_app.py
 !/test_data_web_lokal.py
 !/test_tiga_layar.py
 !/test_unduhan_web_lokal.py
